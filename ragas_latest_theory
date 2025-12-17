@@ -1,0 +1,340 @@
+Here is a **clear, beginner-friendly, section-by-section explanation** of your entire script.
+I will explain:
+
+* 🧠 What each part does
+* 🔗 How all components connect
+* 🧮 What retrieval metrics mean
+* 📝 How RAGAS evaluates the pipeline
+
+Let’s break it down logically.
+
+---
+
+# ⭐ **SECTION 1 — Imports & Environment Setup**
+
+```python
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import PromptTemplate
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from dotenv import load_dotenv
+import math
+load_dotenv()
+```
+
+### ✔ Purpose:
+
+* Load all required libraries
+* Load your **Gemini API key** from `.env`
+* Import tools for:
+
+  * Chunking documents
+  * Vector store (FAISS)
+  * Prompt templates
+  * Gemini embeddings + Gemini LLM
+  * Math (for retrieval metrics)
+
+---
+
+# ⭐ **SECTION 2 — Input Document**
+
+```python
+markdown = '''Deep learning is ...'''
+```
+
+### ✔ Purpose:
+
+This is the **source knowledge** your RAG pipeline will search.
+
+Your system will chunk this text → embed → store in FAISS → retrieve relevant chunks.
+
+---
+
+# ⭐ **SECTION 3 — Chunking the Document**
+
+```python
+splitter = RecursiveCharacterTextSplitter(chunk_size=70, chunk_overlap=10)
+chunks = splitter.create_documents([markdown])
+```
+
+### ✔ Purpose:
+
+Splits the long text into **small chunks**, because:
+
+* Embeddings work best on short text
+* Retrieval becomes more accurate
+* FAISS stores embeddings for each chunk
+
+---
+
+### Add metadata IDs
+
+```python
+for i, chunk in enumerate(chunks):
+    chunk.metadata["id"] = str(i)
+```
+
+✔ Each chunk gets a unique ID like `"0"`, `"1"`, `"2"`
+✔ Needed for retrieval metrics like nDCG, recall, precision.
+
+---
+
+# ⭐ **SECTION 4 — Embeddings + FAISS Vector Store**
+
+```python
+embeddings2 = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+vector_store = FAISS.from_documents(chunks, embeddings2)
+retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+```
+
+### ✔ What happens:
+
+1. Gemini converts each chunk into an **embedding vector**
+2. FAISS stores all these vectors in a searchable index
+3. The retriever returns **top-5 most similar chunks** based on vector similarity
+
+This is the **retrieval** part of RAG.
+
+---
+
+# ⭐ **SECTION 5 — Load the Gemini LLM**
+
+```python
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+```
+
+### ✔ Purpose:
+
+This is the **generator** part of RAG.
+
+* It uses retrieved context
+* Generates final answer
+* Low temperature = more factual & stable
+
+---
+
+# ⭐ **SECTION 6 — Prompt Template**
+
+```python
+prompt = PromptTemplate(
+    template=""" ... """,
+    input_variables=['context', 'question']
+)
+```
+
+### ✔ Purpose:
+
+Defines how the LLM should answer:
+
+* Use only retrieved context
+* If answer not found → Say “I don’t know”
+
+This prevents hallucination.
+
+---
+
+# ⭐ **SECTION 7 — Generate Answer (Full RAG)**
+
+```python
+question = "What is deep learning?"
+retrieved_docs = retriever.invoke(question)
+```
+
+### ✔ What happens:
+
+1. User question → embeddings
+2. FAISS retrieves 5 closest chunks
+3. You create a final prompt:
+
+```python
+context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
+```
+
+4. Pass context + question to LLM
+5. LLM produces final answer
+
+This is your **RAG pipeline** working end-to-end.
+
+---
+
+# ⭐ SECTION 8 — Retrieval Metrics
+
+These measure how GOOD your retriever is.
+
+---
+
+## ✔ **Recall@K**
+
+```python
+def recall_at_k(...):
+```
+
+Measures:
+
+> Out of all correct/relevant documents, how many did the retriever return?
+
+---
+
+## ✔ **Precision@K**
+
+```python
+def precision_at_k(...):
+```
+
+Measures:
+
+> Out of the retrieved docs, how many are actually relevant?
+
+---
+
+## ✔ **MRR (Mean Reciprocal Rank)**
+
+```python
+def mrr(...):
+```
+
+Measures:
+
+> How early does the retriever return the FIRST relevant document?
+
+Higher = better.
+
+---
+
+## ✔ **Hit Rate**
+
+```python
+def hit_rate_at_k(...):
+```
+
+Measures:
+
+> Did we retrieve *at least one* correct document?
+
+---
+
+## ✔ **nDCG**
+
+```python
+def ndcg(...):
+```
+
+Measures:
+
+> How well-ranked the retrieved documents are (importance decreases down the list).
+
+We fixed it so it doesn't crash.
+
+---
+
+# ⭐ SECTION 9 — Automatically Detect Relevant Docs
+
+```python
+keyword = "deep learning".lower()
+
+relevant_docs = {
+    doc.metadata["id"]
+    for doc in chunks
+    if keyword in doc.page_content.lower()
+}
+```
+
+### ✔ Purpose:
+
+Your chunks contain definitions about "deep learning", so all chunks with that phrase are **relevant**.
+
+We automatically identify ground truth instead of manually assigning IDs.
+
+---
+
+# ⭐ SECTION 10 — Print Retrieval Metrics
+
+You print:
+
+* recall@5
+* precision@5
+* MRR
+* hit rate
+* nDCG
+
+These show how well FAISS retrieval worked.
+
+---
+
+# ⭐ SECTION 11 — RAGAS Evaluation
+
+```python
+ragas_data = {
+    "question": [question],
+    "answer": [answer],
+    "contexts": [[doc.page_content for doc in retrieved_docs]],
+    "ground_truths": ["Deep learning refers to neural networks with many layers."]
+}
+```
+
+### ✔ Purpose:
+
+Prepare data for RAGAS scoring.
+
+---
+
+## RAGAS Metrics Used:
+
+### **1. context_precision**
+
+Is retrieved context relevant?
+
+### **2. context_recall**
+
+Did we retrieve all needed information?
+
+### **3. answer_relevancy**
+
+Is the final answer related to the question?
+
+### **4. faithfulness**
+
+Did LLM stay true to the retrieved context?
+
+---
+
+```python
+ragas_result = evaluate(...)
+```
+
+✔ Runs all 4 RAGAS metrics
+✔ Returns scores in a table
+
+---
+
+# ⭐ FINAL OUTPUT OF YOUR SCRIPT
+
+You get:
+
+### ✔ RAG answer
+
+### ✔ Retrieval metrics
+
+### ✔ RAGAS scores
+
+Your pipeline is now:
+
+* fully functional
+* metrics-rich
+* eval-ready
+* industry-correct
+* beginner-friendly
+* using Gemini + FAISS
+
+---
+
+# 🎁 If You Want, I Can Provide:
+
+💡 A diagram of this full RAG pipeline
+💡 A step-by-step explanation workflow
+💡 A notebook-ready version
+💡 A version with Hybrid Retrieval (BM25 + FAISS)
+💡 A version with MultiQueryRetriever
+💡 A UI built in Streamlit
+
+Just tell me **what you want next!**
