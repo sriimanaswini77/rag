@@ -325,3 +325,18 @@ pdf.build(flow)
 print("\nReport Saved Successfully!")
 print("PDF  -> rag_evaluation_report.pdf")
 print("DOCX -> rag_evaluation_report.docx")
+
+
+
+
+
+
+########################## REQUIREMENTS #################
+'''nltk
+rouge-score
+bert-score
+torch
+requests
+reportlab
+python-docx
+'''
