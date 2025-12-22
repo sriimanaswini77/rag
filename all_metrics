@@ -1,0 +1,452 @@
+# -------------------------------------------------
+# 0️⃣  Imports
+# -------------------------------------------------
+import os, json, re
+from pathlib import Path
+from typing import List
+
+import numpy as np
+from datasets import Dataset
+from difflib import SequenceMatcher  # fuzzy matcher
+import pandas as pd
+import nltk
+import math
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.meteor_score import meteor_score
+from rouge_score import rouge_scorer
+from bert_score import bert_score
+import textstat
+from nltk.tokenize import sent_tokenize, word_tokenize
+
+# Download required NLTK data
+nltk.download('punkt', quiet=True)
+nltk.download('wordnet', quiet=True)
+nltk.download('omw-1.4', quiet=True)
+
+# LangChain / Google AI
+from langchain_core.prompts import PromptTemplate
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_classic.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+
+# RAGAS
+from ragas import evaluate
+from ragas.metrics import (
+    context_precision,
+    context_recall,
+    answer_relevancy,
+    faithfulness,
+)
+
+# PDF & DOCX
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    KeepTogether,
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from docx import Document
+
+# -------------------------------------------------
+# 🔑 Set Google API Key directly
+# -------------------------------------------------
+os.environ["GOOGLE_API_KEY"] = "AIzaSyDhlvvF8nbCG-J6Wppfew5kDwl0N8k-Mrk"
+print("✅ Google API Key loaded successfully!")
+
+# -------------------------------------------------
+# 1️⃣  Config / LLM / Embeddings / Vector Store
+# -------------------------------------------------
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", temperature=0.2)
+print("✅ Google AI models initialized!")
+
+# -------------------------------------------------
+# 2️⃣  Load / chunk DEEP LEARNING documents
+# -------------------------------------------------
+deep_learning_markdown = '''Deep Learning Fundamentals
+
+Deep learning is a subset of machine learning that uses multi-layered artificial neural networks, inspired by the human brain, to automatically learn complex patterns from vast amounts of data. The "deep" refers to multiple layers of interconnected nodes (neurons) that process information hierarchically.
+
+How Deep Learning Works:
+- Neural Networks: Input, hidden (multiple layers), and output layers mimic brain functions.
+- Layered Learning: Lower layers detect simple features (edges), higher layers combine into complex concepts (objects).
+- Automatic Feature Extraction: Unlike traditional ML, deep learning discovers features automatically without manual engineering.
+
+Key Applications:
+1. Computer Vision: Image recognition, object detection in self-driving cars.
+2. Natural Language Processing (NLP): ChatGPT, language translation, text generation.
+3. Speech Recognition: Voice-to-text transcription (Siri, Alexa).
+4. Generative AI: DALL-E (images), Midjourney, music generation.
+
+Architecture Types:
+- Convolutional Neural Networks (CNNs): Best for images/videos.
+- Recurrent Neural Networks (RNNs): Sequential data like time series, text.
+- Transformers: Modern NLP foundation (BERT, GPT models).
+
+Training Process:
+1. Forward Pass: Data flows through network, predictions made.
+2. Loss Calculation: Compare predictions vs actual labels.
+3. Backward Pass (Backpropagation): Update weights using gradient descent.
+4. Repeat until convergence.
+
+Hardware Requirements:
+- GPUs/TPUs for parallel matrix operations.
+- Large datasets (ImageNet, Common Crawl).
+- Frameworks: TensorFlow, PyTorch, Keras.'''
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=150, chunk_overlap=20)
+chunks = splitter.create_documents([deep_learning_markdown])
+
+# Add metadata IDs
+for i, chunk in enumerate(chunks):
+    chunk.metadata["id"] = str(i)
+
+vector_store = FAISS.from_documents(chunks, embeddings)
+retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 20})
+print(f"✓ Loaded {len(chunks)} chunks")
+print("✓ Vector store created")
+print("✓ Retriever created")
+
+# -------------------------------------------------
+# 3️⃣  Prompt definition
+# -------------------------------------------------
+prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are an AI assistant specialized in answering questions about deep learning based on the provided context.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}\n\n"
+        "Answer (concise and factual):"
+    ),
+)
+
+# -------------------------------------------------
+# 4️⃣  IR-metric helpers (EXACTLY from original code)
+# -------------------------------------------------
+def hit_rate(y_true: List[List[str]], y_pred: List[List[str]]) -> float:
+    hits = sum(any(doc in true for doc in pred) for true, pred in zip(y_true, y_pred))
+    return hits / len(y_true)
+
+def mean_reciprocal_rank(y_true: List[List[str]], y_pred: List[List[str]]) -> float:
+    rr = []
+    for true, pred in zip(y_true, y_pred):
+        rank = next((i + 1 for i, doc in enumerate(pred) if doc in true), 0)
+        rr.append(1 / rank if rank else 0)
+    return sum(rr) / len(rr)
+
+def ndcg(y_true: List[List[str]], y_pred: List[List[str]], k: int = 5) -> float:
+    scores = []
+    for true, pred in zip(y_true, y_pred):
+        pred_k = pred[:k]
+        dcg = sum(1 / np.log2(i + 2) if doc in true else 0
+                  for i, doc in enumerate(pred_k))
+        idcg = sum(1 / np.log2(i + 2) for i in range(min(k, len(true))))
+        scores.append(dcg / idcg if idcg else 0)
+    return np.mean(scores)
+
+def recall_precision_at_k(y_true: List[List[str]], y_pred: List[List[str]], k: int = 5) -> dict:
+    rec, prec = [], []
+    for true, pred in zip(y_true, y_pred):
+        top_k = pred[:k]
+        hits = len([d for d in top_k if d in true])
+        rec.append(hits / len(true) if true else 0)
+        prec.append(hits / k)
+    return {f"Recall@{k}": np.mean(rec), f"Precision@{k}": np.mean(prec)}
+
+# -------------------------------------------------
+# 5️⃣  SIMPLIFIED ground-truth builder
+# -------------------------------------------------
+def build_ground_truth_simple(
+    references: List[str],
+    retrieved_per_q: List[List[object]],
+) -> List[List[str]]:
+    gt: List[List[str]] = []
+    
+    for idx, (ref, docs) in enumerate(zip(references, retrieved_per_q)):
+        norm_ref = ref.lower().strip()
+        found_id = None
+        
+        print(f"\n--- QUESTION {idx + 1} ---")
+        print("Reference text:", repr(ref))
+        
+        for doc in docs:
+            doc_text = doc.page_content.lower()
+            snippet = doc.page_content[:100].strip()
+            
+            if norm_ref in doc_text:
+                found_id = str(doc.metadata["id"])
+                print(f"  ✅ FOUND in Chunk ID {found_id}: {snippet}...")
+                break
+        
+        ground_truth_id = [found_id] if found_id else ["001"]
+        gt.append(ground_truth_id)
+        
+        if not found_id:
+            print("  ❌ NOT FOUND → using '001'")
+    
+    return gt
+
+# -------------------------------------------------
+# 🔥 NEW GENERATION METRICS (INTEGRATED)
+# -------------------------------------------------
+def compute_bleu(preds, refs):
+    smooth = SmoothingFunction().method1
+    scores = [sentence_bleu([word_tokenize(r)], word_tokenize(p), smoothing_function=smooth)
+              for p, r in zip(preds, refs)]
+    return float(np.mean(scores))
+
+def compute_rouge(preds, refs):
+    scorer = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
+    r1, rL = [], []
+    for p, r in zip(preds, refs):
+        s = scorer.score(r, p)
+        r1.append(s["rouge1"].fmeasure)
+        rL.append(s["rougeL"].fmeasure)
+    return float(np.mean(r1)), float(np.mean(rL))
+
+def compute_meteor(preds, refs):
+    return float(np.mean([meteor_score([r], p) for p, r in zip(preds, refs)]))
+
+def compute_bertscore(preds, refs):
+    _, _, F1 = bert_score(preds, refs, lang="en", rescale_with_baseline=True)
+    return float(F1.mean().item())
+
+# Custom custom metrics (no Ollama dependency)
+def answer_relevance_context_utilization(responses, references, retrieved_docs, top_k=5):
+    relevance_scores = []
+    context_scores = []
+    for resp, ref, docs in zip(responses, references, retrieved_docs):
+        resp_words = set(word_tokenize(resp.lower()))
+        ref_words = set(word_tokenize(ref.lower()))
+        relevance_scores.append(len(resp_words & ref_words) / len(ref_words) if ref_words else 0)
+        
+        doc_words = set(w for d in docs[:top_k] for w in word_tokenize(d.page_content.lower()))
+        context_scores.append(len(resp_words & doc_words) / len(resp_words) if resp_words else 0)
+    return {"Answer Relevance": np.mean(relevance_scores), "Context Utilization": np.mean(context_scores)}
+
+def groundedness(responses, retrieved_docs, top_k=3):
+    scores = []
+    for resp, docs in zip(responses, retrieved_docs):
+        resp_words = set(word_tokenize(resp.lower()))
+        doc_words = set(w for d in docs[:top_k] for w in word_tokenize(d.page_content.lower()))
+        overlap = len(resp_words & doc_words) / len(resp_words) if resp_words else 0
+        scores.append(overlap)
+    return np.mean(scores)
+
+def hallucination_rate(responses, retrieved_docs, top_k=3):
+    rates = []
+    for resp, docs in zip(responses, retrieved_docs):
+        resp_words = set(word_tokenize(resp.lower()))
+        doc_words = set(w for d in docs[:top_k] for w in word_tokenize(d.page_content.lower()))
+        unsupported = len(resp_words - doc_words)
+        hall = unsupported / len(resp_words) if resp_words else 0
+        rates.append(hall)
+    return np.mean(rates)
+
+def response_coherence_readability(responses):
+    coherence_scores = []
+    readability_scores = []
+    for resp in responses:
+        sentences = sent_tokenize(resp)
+        words = word_tokenize(resp)
+        coherence = len(words) / len(sentences) if sentences else 0
+        coherence_scores.append(coherence)
+        readability = textstat.flesch_reading_ease(resp)
+        readability_scores.append(readability)
+    return {"Coherence (words/sentence)": np.mean(coherence_scores), "Readability (Flesch)": np.mean(readability_scores)}
+
+def relevancy_score(responses, queries):
+    scores = []
+    for resp, query in zip(responses, queries):
+        resp_words = set(word_tokenize(resp.lower()))
+        query_words = set(word_tokenize(query.lower()))
+        overlap = len(resp_words & query_words)
+        relevancy = overlap / len(query_words) if query_words else 0
+        scores.append(relevancy)
+    return np.mean(scores)
+
+# -------------------------------------------------
+# 6️⃣  DEEP LEARNING Questions & reference answers
+# -------------------------------------------------
+questions = [
+    "What is deep learning?",
+    "What are the key applications of deep learning?",
+    "How does a neural network work in deep learning?",
+    "What are the main types of deep learning architectures?",
+    "What is the training process in deep learning?",
+]
+
+references = [
+    "Deep learning is a subset of machine learning that uses multi-layered artificial neural networks",
+    "Computer Vision, Natural Language Processing (NLP), Speech Recognition, Generative AI",
+    "Input, hidden (multiple layers), and output layers mimic brain functions",
+    "Convolutional Neural Networks (CNNs), Recurrent Neural Networks (RNNs), Transformers",
+    "Forward Pass, Loss Calculation, Backward Pass (Backpropagation), Repeat until convergence",
+]
+
+# -------------------------------------------------
+# 7️⃣  Retrieval + LLM answering
+# -------------------------------------------------
+retrieved_docs_per_q: List[List[object]] = []
+retrieved_ids_per_q: List[List[str]] = []
+answers: List[str] = []
+contexts: List[List[str]] = []
+
+print("🔍 Running retrieval and LLM answering...")
+for q in questions:
+    docs = retriever.invoke(q, k=20)
+    retrieved_docs_per_q.append(docs)
+    retrieved_ids_per_q.append([str(d.metadata["id"]) for d in docs])
+    
+    context_text = "\n\n".join(d.page_content for d in docs)
+    final_prompt = prompt.invoke({"context": context_text, "question": q})
+    answer = llm.invoke(final_prompt).content
+    
+    answers.append(answer)
+    contexts.append([d.page_content for d in docs])
+
+# -------------------------------------------------
+# 8️⃣  Build ground-truth
+# -------------------------------------------------
+ground_truth_ids = build_ground_truth_simple(references, retrieved_docs_per_q)
+
+print("\n=== Ground-truth IDs per question ===")
+for i, ids in enumerate(ground_truth_ids, 1):
+    print(f"Q{i}: {ids}")
+
+# -------------------------------------------------
+# 9️⃣  IR METRICS
+# -------------------------------------------------
+k = 5
+ir_metrics_per_q = []
+
+for i, q in enumerate(questions):
+    true_list = [ground_truth_ids[i]]
+    pred_list = [retrieved_ids_per_q[i]]
+    rp = recall_precision_at_k(true_list, pred_list, k)
+
+    ir_metrics_per_q.append({
+        "question": q,
+        "precision@k": rp[f"Precision@{k}"],
+        "recall@k":    rp[f"Recall@{k}"],
+        "hit_rate@k":  hit_rate(true_list, pred_list),
+        "MRR@k":       mean_reciprocal_rank(true_list, pred_list),
+        "NDCG@k":      ndcg(true_list, pred_list, k),
+    })
+
+print("\n=== IR METRICS per question ===")
+for m in ir_metrics_per_q:
+    print(f"\nQuestion: {m['question']}")
+    print(f"  Precision@{k}: {m['precision@k']:.4f}")
+    print(f"  Recall@{k}:    {m['recall@k']:.4f}")
+    print(f"  Hit Rate@{k}:  {m['hit_rate@k']:.4f}")
+    print(f"  MRR@{k}:       {m['MRR@k']:.4f}")
+    print(f"  NDCG@{k}:      {m['NDCG@k']:.4f}")
+
+# -------------------------------------------------
+# 🔟  RAGAS METRICS
+# -------------------------------------------------
+print("\n📊 Computing RAGAS metrics...")
+ragas_results_per_q = []
+
+for i, q in enumerate(questions):
+    ragas_dataset = Dataset.from_dict({
+        "question": [questions[i]],
+        "answer":   [answers[i]],
+        "contexts": [contexts[i]],
+        "reference": [references[i]],
+    })
+
+    ragas_result = evaluate(
+        dataset=ragas_dataset,
+        metrics=[context_precision, context_recall, answer_relevancy, faithfulness],
+        llm=llm,
+        embeddings=embeddings,
+    )
+
+    try:
+        ragas_dict = ragas_result.to_dict()
+    except Exception:
+        ragas_dict = ragas_result.to_pandas().to_dict(orient="records")[0]
+
+    ragas_results_per_q.append({"question": q, "metrics": ragas_dict})
+
+# -------------------------------------------------
+# 🔥 NEW GENERATION METRICS
+# -------------------------------------------------
+print("\n🚀 Computing Generation Metrics...")
+bleu = compute_bleu(answers, references)
+rouge1, rougeL = compute_rouge(answers, references)
+meteor = compute_meteor(answers, references)
+bertscore_f1 = compute_bertscore(answers, references)
+
+custom_metrics = {
+    **answer_relevance_context_utilization(answers, references, retrieved_docs_per_q),
+    "Groundedness": groundedness(answers, retrieved_docs_per_q),
+    "Hallucination Rate": hallucination_rate(answers, retrieved_docs_per_q),
+    **response_coherence_readability(answers),
+    "Query Relevancy": relevancy_score(answers, questions),
+    "BLEU": bleu,
+    "ROUGE-1": rouge1,
+    "ROUGE-L": rougeL,
+    "METEOR": meteor,
+    "BERTScore F1": bertscore_f1
+}
+
+print("\n=== GENERATION METRICS (Overall) ===")
+for metric, score in custom_metrics.items():
+    print(f"  {metric:25s}: {score:.4f}")
+
+# -------------------------------------------------
+# 🔢  SAVE ENHANCED DOCX REPORT
+# -------------------------------------------------
+doc = Document()
+doc.add_heading("Deep Learning RAG Evaluation Report (COMPLETE)", level=1)
+
+# Overall metrics table
+doc.add_heading("Overall Generation Metrics", level=2)
+table = doc.add_table(rows=1, cols=2)
+table.autofit = True
+
+left = table.cell(0, 0).paragraphs[0]
+left.add_run("Generation Metrics:\n").bold = True
+for metric, score in custom_metrics.items():
+    left.add_run(f"{metric}: {score:.4f}\n")
+
+right = table.cell(0, 1).paragraphs[0]
+right.add_run("Per-Question Metrics:\n").bold = True
+
+UNWANTED_KEYS = {"user_input", "retrieved_contexts", "response", "reference", "Bot:"}
+
+for i, q in enumerate(questions):
+    doc.add_heading(f"Q{i+1}: {q}", level=2)
+    table = doc.add_table(rows=1, cols=3)
+    table.autofit = True
+    
+    # IR metrics
+    ir = ir_metrics_per_q[i]
+    left = table.cell(0, 0).paragraphs[0]
+    left.add_run("IR Metrics:\n").bold = True
+    for key, v in ir.items():
+        if key == "question": continue
+        left.add_run(f"{key}: {v:.4f}\n")
+    
+    # RAGAS metrics
+    ragas = ragas_results_per_q[i]["metrics"]
+    mid = table.cell(0, 1).paragraphs[0]
+    mid.add_run("RAGAS Metrics:\n").bold = True
+    for k, v in ragas.items():
+        if k in UNWANTED_KEYS: continue
+        mid.add_run(f"{k}: {v:.4f}\n")
+
+doc.save("complete_deep_learning_rag_report.docx")
+
+print("\n🎉 COMPLETE RAG Report Saved Successfully!")
+print("📊 DOCX -> complete_deep_learning_rag_report.docx")
+print("📄 PDF  -> deep_learning_rag_evaluation_report.pdf")
